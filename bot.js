@@ -1,50 +1,42 @@
-const http = require('http');
+// Zetsu Bot v3.0 — Autonomous 24/7 Cloud Personal AI Assistant
+// Features: Voice (native audio), Vision/PDF (OCR & analysis), Obsidian Notes,
+// Daily Note Inbox, URL Summarizer, Long-term Memory, Reminders (UTC+5),
+// Morning Briefing, and Telegram Business Secretary.
+
 const https = require('https');
 const storage = require('./storage');
 
-// Crash protection
-process.on('uncaughtException', (err) => {
-  console.error('[Uncaught Exception]', err.stack || err.message);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[Unhandled Rejection]', reason?.stack || reason?.message || reason);
-});
+process.on('uncaughtException', (err) => console.error('[Uncaught Exception]', err.stack || err.message));
+process.on('unhandledRejection', (reason) => console.error('[Unhandled Rejection]', reason?.stack || reason?.message || reason));
 
-const PORT = parseInt(process.env.PORT || '7860', 10);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || '0', 10);
-const TZ_OFFSET_HOURS = 5; // UTC+5 (Almaty / Astana / Yekaterinburg)
-const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 60 * 60 * 1000;
+const TZ_OFFSET_MS = 5 * 60 * 60 * 1000; // UTC+5 (Almaty / Astana)
 
-// Optional finite cloud runner duration (e.g. --run-minutes=20 for GitHub Actions seamless handoff)
 const runMinArg = process.argv.find(a => a.startsWith('--run-minutes='));
 const RUN_MINUTES = runMinArg ? parseFloat(runMinArg.split('=')[1]) : 0;
 let isShuttingDown = false;
-
-if (!BOT_TOKEN) {
-  console.error('FATAL: BOT_TOKEN environment variable is missing!');
-}
+let stateDirty = false;
 
 let businessConnectionId = process.env.BUSINESS_CONNECTION_ID || '';
-const startedAt = Date.now();
-let lastPollOkAt = Date.now();
+let lastUpdateId = 0;
+let cachedMemory = '';
+let adminChatHistory = [];
+const MAX_ADMIN_HISTORY = 12;
 
-// Default persistent state (populated from private GitHub state.json on startup)
+// Clean persistent state (no Diceplay/Kotya bloat, no API keys)
 let state = {
   lastUpdateId: 0,
   businessConnectionId: '',
   adminChatHistory: [],
   config: {
-    chat_id: '',
-    chat_title: '',
-    message_thread_id: null,
-    is_running: false,
-    mode: 'bot',
-    gemini_api_key: process.env.GEMINI_API_KEY || '',
     business_auto_reply: false,
+    morning_briefing_enabled: true,
+    morning_briefing_hour: 8,
+    morning_briefing_minute: 30,
+    last_briefing_date: '',
     last_business_chat_id: null,
-    last_business_sender_name: '',
-    tasks: []
+    last_business_sender_name: ''
   },
   knownUsers: {},
   reminders: [] // { id, text, triggerAtMs, repeat: 'none'|'hourly'|'daily'|'weekly', createdAtMs }
@@ -69,50 +61,20 @@ function getCurrentLocalISO() {
   const d = new Date(Date.now() + TZ_OFFSET_MS);
   const pad = (n) => String(n).padStart(2, '0');
   const days = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
-  const iso = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+05:00`;
-  return `${iso} (${days[d.getUTCDay()]}, UTC+5)`;
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+05:00 (${days[d.getUTCDay()]}, UTC+5)`;
 }
 
-function persistState(immediate = false) {
-  // Never persist raw API keys into GitHub state.json
+async function flushState(force = false) {
+  if (!force && !stateDirty) return;
   state.lastUpdateId = lastUpdateId;
   state.businessConnectionId = businessConnectionId;
   state.adminChatHistory = adminChatHistory.slice(-MAX_ADMIN_HISTORY * 2);
-  const safeCopy = JSON.parse(JSON.stringify(state));
-  delete safeCopy.config.gemini_api_key;
-  return storage.saveStateDebounced(safeCopy, immediate);
+  await storage.saveStateNow(state);
+  stateDirty = false;
 }
 
 // ==========================================
-// HTTP Health Server (required for HF Docker Space 24/7)
-// ==========================================
-const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/health') {
-    const body = JSON.stringify({
-      status: 'ok',
-      bot: '@zetsukbot',
-      version: '2.0.0-cloud',
-      uptime_sec: Math.floor((Date.now() - startedAt) / 1000),
-      last_poll_ok_ago_sec: Math.floor((Date.now() - lastPollOkAt) / 1000),
-      active_reminders: state.reminders.length,
-      scheduler_running: state.config.is_running,
-      autoreply_enabled: state.config.business_auto_reply,
-      local_time: getCurrentLocalISO()
-    }, null, 2);
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  res.writeHead(404);
-  res.end('Not Found');
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  log(`HTTP Health server listening on 0.0.0.0:${PORT}`);
-});
-
-// ==========================================
-// Telegram Bot API Helper
+// Telegram Bot API Helpers + File Download
 // ==========================================
 function tgCall(method, params = {}) {
   return new Promise((resolve) => {
@@ -133,51 +95,46 @@ function tgCall(method, params = {}) {
         res.on('data', c => d += c);
         res.on('end', () => {
           if (timer) clearTimeout(timer);
-          try {
-            resolve(JSON.parse(d));
-          } catch (e) {
-            resolve({ ok: false, error: e.message, raw: d });
-          }
+          try { resolve(JSON.parse(d)); }
+          catch (e) { resolve({ ok: false, error: e.message }); }
         });
       });
-
-      const timeoutMs = (method === 'getUpdates') ? 35000 : 15000;
       timer = setTimeout(() => {
         try { req.destroy(); } catch (_) {}
         resolve({ ok: false, error: 'Socket timeout' });
-      }, timeoutMs);
-
-      req.on('error', (err) => {
-        if (timer) clearTimeout(timer);
-        log(`tgCall error [${method}]: ${err.message}`);
-        resolve({ ok: false, error: err.message });
-      });
-
+      }, method === 'getUpdates' ? 35000 : 15000);
+      req.on('error', err => { if (timer) clearTimeout(timer); resolve({ ok: false, error: err.message }); });
       req.write(postData);
       req.end();
     } catch (err) {
       if (timer) clearTimeout(timer);
-      log(`tgCall exception [${method}]: ${err.message}`);
       resolve({ ok: false, error: err.message });
     }
   });
 }
 
+async function downloadTelegramFile(fileId) {
+  const info = await tgCall('getFile', { file_id: fileId });
+  if (!info.ok || !info.result?.file_path) return null;
+  if ((info.result.file_size || 0) > 15 * 1024 * 1024) {
+    return { error: 'Файл слишком большой (>15 МБ)' };
+  }
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${info.result.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const arrBuf = await res.arrayBuffer();
+  return {
+    base64: Buffer.from(arrBuf).toString('base64'),
+    filePath: info.result.file_path
+  };
+}
+
+// Clean 4-button persistent bottom keyboard
 function getPersistentKeyboard() {
   return {
     keyboard: [
-      [
-        { text: '📝 Мои заметки' },
-        { text: '⏰ Напоминания' }
-      ],
-      [
-        { text: state.config.business_auto_reply ? '🔕 Выключить автоответчик' : '🔔 Включить автоответчик' },
-        { text: state.config.is_running ? '⏸ Отключить Дисплей' : '▶️ Включить Дисплей' }
-      ],
-      [
-        { text: '📊 Статус и Панель' },
-        { text: '🚀 Тест отправки' }
-      ]
+      [{ text: '📝 Заметки' }, { text: '⏰ Напоминания' }],
+      [{ text: '🧠 Память' }, { text: '⚙️ Панель' }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -185,61 +142,38 @@ function getPersistentKeyboard() {
 }
 
 async function notifyAdmin(text, replyMarkup = null) {
-  try {
-    return await tgCall('sendMessage', {
-      chat_id: ADMIN_ID,
-      text,
-      parse_mode: 'HTML',
-      reply_markup: replyMarkup || getPersistentKeyboard()
-    });
-  } catch (e) {
-    log('Failed to notify admin: ' + e.message);
-  }
+  return tgCall('sendMessage', {
+    chat_id: ADMIN_ID,
+    text,
+    parse_mode: 'HTML',
+    reply_markup: replyMarkup || getPersistentKeyboard()
+  });
 }
 
 async function sendLongMessage(chatId, text, replyMarkup = null) {
   const CHUNK_SIZE = 3800;
   if (text.length <= CHUNK_SIZE) {
-    return await tgCall('sendMessage', {
-      chat_id: chatId,
-      text,
-      reply_markup: replyMarkup || undefined
-    });
+    return tgCall('sendMessage', { chat_id: chatId, text, reply_markup: replyMarkup || undefined });
   }
-  const parts = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= CHUNK_SIZE) {
-      parts.push(remaining);
-      break;
+  let rem = text;
+  while (rem.length > 0) {
+    if (rem.length <= CHUNK_SIZE) {
+      return tgCall('sendMessage', { chat_id: chatId, text: rem, reply_markup: replyMarkup || undefined });
     }
-    let splitIdx = remaining.lastIndexOf('\n', CHUNK_SIZE);
-    if (splitIdx === -1 || splitIdx < CHUNK_SIZE / 2) splitIdx = CHUNK_SIZE;
-    parts.push(remaining.substring(0, splitIdx));
-    remaining = remaining.substring(splitIdx).trim();
-  }
-  for (let i = 0; i < parts.length; i++) {
-    await tgCall('sendMessage', {
-      chat_id: chatId,
-      text: parts[i],
-      reply_markup: (i === parts.length - 1) ? replyMarkup : undefined
-    });
+    let idx = rem.lastIndexOf('\n', CHUNK_SIZE);
+    if (idx === -1 || idx < CHUNK_SIZE / 2) idx = CHUNK_SIZE;
+    await tgCall('sendMessage', { chat_id: chatId, text: rem.slice(0, idx) });
+    rem = rem.slice(idx).trim();
   }
 }
 
 async function sendAsMe(targetChatId, text) {
-  if (!businessConnectionId) {
-    return { ok: false, error: 'Business connection не активен' };
-  }
-  return await tgCall('sendMessage', {
-    business_connection_id: businessConnectionId,
-    chat_id: targetChatId,
-    text
-  });
+  if (!businessConnectionId) return { ok: false, error: 'Business connection не активен' };
+  return tgCall('sendMessage', { business_connection_id: businessConnectionId, chat_id: targetChatId, text });
 }
 
 // ==========================================
-// Gemini AI + Function Calling (Notes & Reminders Tools)
+// Gemini AI v3 (Multimodal + Native Function Calling)
 // ==========================================
 const GEMINI_MODELS = [
   'gemini-flash-lite-latest',
@@ -253,131 +187,145 @@ const ZETSU_TOOLS = [{
   functionDeclarations: [
     {
       name: 'save_note',
-      description: 'Сохраняет или дополняет личную заметку пользователя в облачное хранилище (Obsidian-совместимый Markdown). Вызывай, когда пользователь просит записать, сохранить, запомнить заметку, идею, список, рецепт или мысль.',
+      description: 'Создаёт или дополняет отдельную заметку в Obsidian (notes/<название>.md). Используй для структурированных заметок, конспектов, списков, статей.',
       parameters: {
         type: 'OBJECT',
         properties: {
-          title: { type: 'STRING', description: 'Короткий понятный заголовок заметки (без .md)' },
-          content: { type: 'STRING', description: 'Содержимое заметки в Markdown' },
-          tags: {
-            type: 'ARRAY',
-            items: { type: 'STRING' },
-            description: 'Необязательные теги без символа # (например: ["медицина", "идея", "личное"])'
-          },
-          append: {
-            type: 'BOOLEAN',
-            description: 'true — если нужно дописать в существующую заметку с таким же заголовком, false — создать новую или перезаписать'
-          }
+          title: { type: 'STRING', description: 'Короткий понятный заголовок без .md' },
+          content: { type: 'STRING', description: 'Содержимое в Markdown (можно использовать чекбоксы - [ ] и [[ссылки]])' },
+          tags: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Теги без #' },
+          append: { type: 'BOOLEAN', description: 'true — дописать в существующую заметку' }
         },
         required: ['title', 'content']
       }
     },
     {
-      name: 'search_notes',
-      description: 'Ищет или показывает список всех сохраненных заметок пользователя.',
+      name: 'append_daily_note',
+      description: 'Быстро дописывает мысль, задачу, цитату или пересланное сообщение в сегодняшнюю ежедневную заметку (notes/daily/YYYY-MM-DD.md).',
       parameters: {
         type: 'OBJECT',
         properties: {
-          query: { type: 'STRING', description: 'Поисковый запрос (пустая строка — показать все заметки)' }
+          text: { type: 'STRING', description: 'Текст записи' },
+          is_task: { type: 'BOOLEAN', description: 'true — оформить как задачу с чекбоксом - [ ]' }
+        },
+        required: ['text']
+      }
+    },
+    {
+      name: 'search_notes',
+      description: 'Ищет заметки по ключевому слову или показывает список всех заметок (включая Daily Notes).',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          query: { type: 'STRING', description: 'Поисковый запрос (или пусто для полного списка)' }
         }
       }
     },
     {
       name: 'read_note',
-      description: 'Читает полное содержимое конкретной заметки по заголовку.',
+      description: 'Читает полное содержимое заметки по заголовку или дате.',
       parameters: {
         type: 'OBJECT',
-        properties: {
-          title: { type: 'STRING', description: 'Название заметки' }
-        },
+        properties: { title: { type: 'STRING' } },
         required: ['title']
       }
     },
     {
       name: 'delete_note',
-      description: 'Удаляет заметку по названию (только если пользователь явно попросил удалить).',
+      description: 'Удаляет заметку (только по явному запросу пользователя).',
       parameters: {
         type: 'OBJECT',
-        properties: {
-          title: { type: 'STRING', description: 'Название заметки для удаления' }
-        },
+        properties: { title: { type: 'STRING' } },
         required: ['title']
       }
     },
     {
       name: 'create_reminder',
-      description: 'Создаёт уведомление / напоминание, которое бот автоматически пришлёт пользователю в Telegram в указанное время (работает 24/7 без ноутбука).',
+      description: 'Создаёт напоминание в Telegram на точное время (UTC+5).',
       parameters: {
         type: 'OBJECT',
         properties: {
           text: { type: 'STRING', description: 'Текст напоминания' },
-          trigger_at_iso: {
-            type: 'STRING',
-            description: 'Точная дата и время срабатывания в формате ISO-8601 с часовым поясом +05:00 (например: "2026-11-27T09:00:00+05:00")'
-          },
-          repeat: {
-            type: 'STRING',
-            enum: ['none', 'hourly', 'daily', 'weekly'],
-            description: 'Повторение: none (один раз), hourly (каждый час), daily (каждый день), weekly (каждую неделю)'
-          }
+          trigger_at_iso: { type: 'STRING', description: 'Дата/время ISO-8601 с +05:00, напр. 2026-11-27T09:00:00+05:00' },
+          repeat: { type: 'STRING', enum: ['none', 'hourly', 'daily', 'weekly'] }
         },
         required: ['text', 'trigger_at_iso']
       }
     },
     {
       name: 'list_reminders',
-      description: 'Показывает список всех активных напоминаний пользователя.',
+      description: 'Показывает список активных напоминаний.',
       parameters: { type: 'OBJECT', properties: {} }
     },
     {
       name: 'delete_reminder',
-      description: 'Удаляет/отменяет напоминание по его ID.',
+      description: 'Удаляет напоминание по ID.',
       parameters: {
         type: 'OBJECT',
-        properties: {
-          id: { type: 'STRING', description: 'ID напоминания' }
-        },
+        properties: { id: { type: 'STRING' } },
         required: ['id']
+      }
+    },
+    {
+      name: 'remember_fact',
+      description: 'Запоминает важный долгосрочный факт о пользователе в memory.md (предпочтения, проекты, привычки, важные даты/люди).',
+      parameters: {
+        type: 'OBJECT',
+        properties: { fact: { type: 'STRING', description: 'Краткий чёткий факт для долгосрочной памяти' } },
+        required: ['fact']
+      }
+    },
+    {
+      name: 'forget_fact',
+      description: 'Удаляет устаревший факт из долгосрочной памяти memory.md по ключевому слову.',
+      parameters: {
+        type: 'OBJECT',
+        properties: { query: { type: 'STRING' } },
+        required: ['query']
+      }
+    },
+    {
+      name: 'fetch_url',
+      description: 'Загружает текстовое содержимое веб-страницы по URL для краткого пересказа, анализа или сохранения в заметку.',
+      parameters: {
+        type: 'OBJECT',
+        properties: { url: { type: 'STRING' } },
+        required: ['url']
       }
     }
   ]
 }];
 
 async function executeToolCall(name, args = {}) {
-  log(`[AI Tool] ${name}(${JSON.stringify(args)})`);
+  log(`[Tool] ${name}(${JSON.stringify(args).slice(0, 180)})`);
   try {
     if (name === 'save_note') {
-      const res = await storage.saveNote({
+      const r = await storage.saveNote({
         title: args.title || 'Заметка',
         content: args.content || '',
         tags: args.tags || [],
         append: Boolean(args.append)
       });
-      return res.ok
-        ? { ok: true, message: `Заметка «${args.title}» сохранена в облако (${res.filePath})`, appended: res.appended }
-        : { ok: false, error: 'Не удалось сохранить заметку в GitHub' };
+      return r.ok ? { ok: true, filePath: r.filePath, appended: r.appended } : { ok: false, error: 'GitHub error' };
     }
-
+    if (name === 'append_daily_note') {
+      return await storage.appendDailyNote(args.text || '', Boolean(args.is_task));
+    }
     if (name === 'search_notes') {
-      const list = await storage.listNotes(args.query || '');
-      return { ok: true, count: list.length, notes: list };
+      const notes = await storage.listNotes(args.query || '');
+      return { ok: true, count: notes.length, notes: notes.slice(0, 30) };
     }
-
     if (name === 'read_note') {
       const note = await storage.readNote(args.title || '');
-      return note ? { ok: true, note } : { ok: false, error: 'Заметка не найдена' };
+      return note ? { ok: true, note } : { ok: false, error: 'Не найдено' };
     }
-
     if (name === 'delete_note') {
       return await storage.deleteNote(args.title || '');
     }
-
     if (name === 'create_reminder') {
       const ms = Date.parse(args.trigger_at_iso);
-      if (isNaN(ms)) {
-        return { ok: false, error: `Некорректный формат даты: ${args.trigger_at_iso}` };
-      }
-      const id = 'rem_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      if (isNaN(ms)) return { ok: false, error: `Некорректная дата: ${args.trigger_at_iso}` };
+      const id = 'rem_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 4);
       const reminder = {
         id,
         text: String(args.text || 'Напоминание').trim(),
@@ -386,43 +334,37 @@ async function executeToolCall(name, args = {}) {
         createdAtMs: Date.now()
       };
       state.reminders.push(reminder);
-      await persistState(true);
-      return {
-        ok: true,
-        id,
-        scheduled_for: formatLocalDateTime(ms),
-        repeat: reminder.repeat,
-        text: reminder.text
-      };
+      stateDirty = true;
+      await flushState(true);
+      return { ok: true, id, scheduled_for: formatLocalDateTime(ms), repeat: reminder.repeat };
     }
-
     if (name === 'list_reminders') {
       const sorted = [...state.reminders].sort((a, b) => a.triggerAtMs - b.triggerAtMs);
-      return {
-        ok: true,
-        count: sorted.length,
-        reminders: sorted.map(r => ({
-          id: r.id,
-          text: r.text,
-          time: formatLocalDateTime(r.triggerAtMs),
-          repeat: r.repeat
-        }))
-      };
+      return { ok: true, count: sorted.length, reminders: sorted.map(r => ({ id: r.id, text: r.text, time: formatLocalDateTime(r.triggerAtMs), repeat: r.repeat })) };
     }
-
     if (name === 'delete_reminder') {
       const before = state.reminders.length;
       state.reminders = state.reminders.filter(r => r.id !== args.id);
-      if (state.reminders.length === before) {
-        return { ok: false, error: 'Напоминание с таким ID не найдено' };
-      }
-      await persistState(true);
+      if (state.reminders.length === before) return { ok: false, error: 'Напоминание не найдено' };
+      stateDirty = true;
+      await flushState(true);
       return { ok: true, deleted_id: args.id };
     }
-
+    if (name === 'remember_fact') {
+      const r = await storage.rememberFact(args.fact || '');
+      if (r.ok) cachedMemory = await storage.loadMemory();
+      return r;
+    }
+    if (name === 'forget_fact') {
+      const r = await storage.forgetFact(args.query || '');
+      if (r.ok) cachedMemory = await storage.loadMemory();
+      return r;
+    }
+    if (name === 'fetch_url') {
+      return await storage.fetchUrlText(args.url || '');
+    }
     return { ok: false, error: `Unknown tool: ${name}` };
   } catch (err) {
-    log(`[AI Tool Error] ${name}: ${err.message}`);
     return { ok: false, error: err.message };
   }
 }
@@ -435,7 +377,7 @@ function queryGeminiRaw(model, bodyObj, apiKey) {
         hostname: 'generativelanguage.googleapis.com',
         path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
         method: 'POST',
-        timeout: 25000,
+        timeout: 30000,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postData)
@@ -453,250 +395,205 @@ function queryGeminiRaw(model, bodyObj, apiKey) {
             } else {
               resolve({ ok: false, error: 'Пустой ответ от Gemini' });
             }
-          } catch (e) {
-            resolve({ ok: false, error: e.message });
-          }
+          } catch (e) { resolve({ ok: false, error: e.message }); }
         });
       });
       req.on('error', err => resolve({ ok: false, error: err.message }));
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({ ok: false, error: 'Таймаут запроса к Gemini' });
-      });
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'Таймаут Gemini' }); });
       req.write(postData);
       req.end();
-    } catch (e) {
-      resolve({ ok: false, error: e.message });
-    }
+    } catch (e) { resolve({ ok: false, error: e.message }); }
   });
 }
 
 async function callGeminiWithFallback(contents, systemText, useTools = false) {
-  const apiKey = state.config.gemini_api_key || process.env.GEMINI_API_KEY;
-  if (!apiKey) return { ok: false, error: 'Gemini API key не настроен.' };
-
-  const body = {
-    contents,
-    systemInstruction: { parts: [{ text: systemText }] }
-  };
+  const apiKey = process.env.GEMINI_API_KEY || '';
+  if (!apiKey) return { ok: false, error: 'GEMINI_API_KEY не настроен.' };
+  const body = { contents, systemInstruction: { parts: [{ text: systemText }] } };
   if (useTools) body.tools = ZETSU_TOOLS;
 
   let lastError = '';
   for (const model of GEMINI_MODELS) {
     const res = await queryGeminiRaw(model, body, apiKey);
     if (res.ok) return res;
-    log(`Gemini [${model}] error (${res.code || '?'}): ${res.error}`);
+    log(`Gemini [${model}] error: ${res.error}`);
     lastError = res.error;
   }
-  return { ok: false, error: lastError || 'Все модели Gemini временно недоступны.' };
+  return { ok: false, error: lastError || 'Модели Gemini недоступны.' };
 }
 
-// Agentic AI loop for Admin (supports tool calling for Notes & Reminders)
-let adminChatHistory = [];
-const MAX_ADMIN_HISTORY = 12;
+async function askZetsuAgent(userParts, textSummaryForHistory) {
+  const memoryBlock = cachedMemory.trim()
+    ? `\n\n--- ДОЛГОСРОЧНАЯ ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ (memory.md) ---\n${cachedMemory.slice(0, 3000)}\n--- КОНЕЦ ПАМЯТИ ---`
+    : '';
 
-async function askZetsuAgent(userMessage) {
   const systemText =
-    `Ты — Zetsu v2.0, облачный 24/7 клинический, технический и персональный ИИ-ассистент DevilVsLife.\n` +
-    `Текущее локальное время пользователя: ${getCurrentLocalISO()}.\n\n` +
-    `У тебя есть встроенные инструменты (tools):\n` +
-    `- save_note / search_notes / read_note / delete_note — работа с личными Obsidian-заметками пользователя в облаке (GitHub).\n` +
-    `- create_reminder / list_reminders / delete_reminder — установка и управление уведомлениями/напоминаниями в Telegram.\n\n` +
-    `Правила:\n` +
-    `1. Если пользователь просит что-то записать, сохранить в заметки, запомнить — СРАЗУ вызывай save_note с аккуратным заголовком и структурированным текстом.\n` +
-    `2. Если пользователь просит напомнить, разбудить, пнуть, уведомить через N минут/часов, завтра, в конкретное время или регулярно — СРАЗУ вычисли точное время в +05:00 относительно текущего времени и вызови create_reminder.\n` +
-    `3. Если пользователь спрашивает про свои заметки или напоминания — вызывай search_notes / read_note / list_reminders.\n` +
-    `4. Ты эксперт в доказательной медицине (UpToDate, Lexicomp, клинические протоколы МЗ РК, ЭКГ, фармакотерапия) и программировании.\n` +
-    `5. Отвечай живо, четко, емко и по делу, удобно для чтения в Telegram.`;
+    `Ты — Zetsu v3.0, персональный облачный 24/7 ИИ-ассистент DevilVsLife в Telegram.\n` +
+    `Текущее локальное время пользователя: ${getCurrentLocalISO()}.${memoryBlock}\n\n` +
+    `Твои инструменты:\n` +
+    `- save_note / append_daily_note / search_notes / read_note / delete_note — Obsidian-заметки в приватном облаке.\n` +
+    `- create_reminder / list_reminders / delete_reminder — напоминания в Telegram (UTC+5).\n` +
+    `- remember_fact / forget_fact — долгосрочная память о пользователе.\n` +
+    `- fetch_url — чтение и конспектирование ссылок.\n\n` +
+    `Правила поведения:\n` +
+    `1. Если пришло голосовое сообщение — сначала кратко передай суть (без слов-паразитов) и СРАЗУ выполни действие (запиши заметку, поставь напоминание или ответь на вопрос).\n` +
+    `2. Если пришло фото/документ (анализы, ЭКГ, рецепт, скриншот, PDF) — внимательно разбери содержимое и при необходимости предложи или сразу сохрани в заметку.\n` +
+    `3. Если пользователь скинул ссылку — вызови fetch_url, сделай ёмкую выжимку и предложи/сохрани в заметку.\n` +
+    `4. Если пользователь просит что-то запомнить о себе надолго — вызови remember_fact.\n` +
+    `5. Для быстрых мыслей/дел на сегодня используй append_daily_note; для полноценных тем/конспектов — save_note.\n` +
+    `6. Ты силён в доказательной медицине (UpToDate, Lexicomp, протоколы МЗ РК, ЭКГ) и IT. Отвечай чётко, живо и удобно для Telegram.`;
 
-  adminChatHistory.push({ role: 'user', parts: [{ text: userMessage }] });
-  if (adminChatHistory.length > MAX_ADMIN_HISTORY * 2) {
-    adminChatHistory = adminChatHistory.slice(-MAX_ADMIN_HISTORY * 2);
-  }
-
-  // Working copy of turns for multi-step tool calling
-  const workingContents = [...adminChatHistory];
+  // Keep lightweight text-only history so binary audio/image buffers never bloat context
+  const workingContents = [...adminChatHistory, { role: 'user', parts: userParts }];
 
   for (let step = 0; step < 5; step++) {
     const res = await callGeminiWithFallback(workingContents, systemText, true);
-    if (!res.ok) {
-      adminChatHistory.pop();
-      return { ok: false, error: res.error };
-    }
+    if (!res.ok) return { ok: false, error: res.error };
 
     const parts = res.content.parts || [];
     const fnCalls = parts.filter(p => p.functionCall);
 
     if (fnCalls.length === 0) {
       const textReply = parts.map(p => p.text || '').join('\n').trim() || 'Готово!';
+      adminChatHistory.push({ role: 'user', parts: [{ text: textSummaryForHistory }] });
       adminChatHistory.push({ role: 'model', parts: [{ text: textReply }] });
+      if (adminChatHistory.length > MAX_ADMIN_HISTORY * 2) {
+        adminChatHistory = adminChatHistory.slice(-MAX_ADMIN_HISTORY * 2);
+      }
       return { ok: true, text: textReply, model: res.model };
     }
 
-    // Add model's tool call turn
     workingContents.push(res.content);
-
-    // Execute all requested tool calls and return functionResponse parts
     const responseParts = [];
     for (const fcPart of fnCalls) {
       const { name, args } = fcPart.functionCall;
       const toolResult = await executeToolCall(name, args);
-      responseParts.push({
-        functionResponse: {
-          name,
-          response: toolResult
-        }
-      });
+      responseParts.push({ functionResponse: { name, response: toolResult } });
     }
     workingContents.push({ role: 'user', parts: responseParts });
   }
-
-  adminChatHistory.pop();
   return { ok: false, error: 'Превышен лимит шагов агента.' };
 }
 
-// Simple Gemini query for Business Auto-Reply (no private tools exposed to strangers!)
-async function askGeminiSimple(promptText, systemText) {
-  const contents = [{ role: 'user', parts: [{ text: promptText }] }];
-  const res = await callGeminiWithFallback(contents, systemText, false);
-  if (!res.ok) return res;
-  const text = (res.content.parts || []).map(p => p.text || '').join('\n').trim();
-  return { ok: true, text, model: res.model };
-}
-
 // ==========================================
-// Reminder Engine (24/7 Cloud Loop)
+// Reminder Engine + Morning Briefing (08:30 UTC+5)
 // ==========================================
 function advanceRepeatTime(triggerAtMs, repeat) {
   const now = Date.now();
-  let stepMs = 0;
-  if (repeat === 'hourly') stepMs = 60 * 60 * 1000;
-  else if (repeat === 'daily') stepMs = 24 * 60 * 60 * 1000;
-  else if (repeat === 'weekly') stepMs = 7 * 24 * 60 * 60 * 1000;
+  const stepMap = { hourly: 3600000, daily: 86400000, weekly: 604800000 };
+  const stepMs = stepMap[repeat];
   if (!stepMs) return null;
   let next = triggerAtMs + stepMs;
   while (next <= now) next += stepMs;
   return next;
 }
 
-async function checkReminders() {
-  if (!state.reminders || state.reminders.length === 0) return;
+async function checkRemindersAndBriefing() {
   const now = Date.now();
-  let changed = false;
-  const remaining = [];
 
-  for (const r of state.reminders) {
-    if (now >= r.triggerAtMs) {
-      changed = true;
-      const repeatLabel = {
-        none: 'Разовое',
-        hourly: 'Каждый час',
-        daily: 'Ежедневно',
-        weekly: 'Еженедельно'
-      }[r.repeat] || 'Разовое';
-
-      const inlineKb = {
-        inline_keyboard: [[
-          { text: '✅ Понял', callback_data: `rem_ack_${r.id}` },
-          { text: '⏰ +15 мин', callback_data: `rem_snooze15_${r.id}` },
-          { text: '⏰ +1 час', callback_data: `rem_snooze60_${r.id}` }
-        ]]
-      };
-
-      log(`[Reminder Fired] ${r.id}: ${r.text}`);
-      await notifyAdmin(
-        `⏰ <b>Напоминание от Zetsu!</b>\n\n` +
-        `📌 ${escapeHtml(r.text)}\n\n` +
-        `🕒 <i>${formatLocalDateTime(now)} • ${repeatLabel}</i>`,
-        inlineKb
-      );
-
-      if (r.repeat && r.repeat !== 'none') {
-        const nextMs = advanceRepeatTime(r.triggerAtMs, r.repeat);
-        if (nextMs) {
-          r.triggerAtMs = nextMs;
-          remaining.push(r);
+  // 1. Due reminders
+  if (state.reminders.length > 0) {
+    let changed = false;
+    const remaining = [];
+    for (const r of state.reminders) {
+      if (now >= r.triggerAtMs) {
+        changed = true;
+        const repeatLabel = { none: 'Разовое', hourly: 'Каждый час', daily: 'Ежедневно', weekly: 'Еженедельно' }[r.repeat] || 'Разовое';
+        const inlineKb = {
+          inline_keyboard: [[
+            { text: '✅ Понял', callback_data: `rem_ack_${r.id}` },
+            { text: '⏰ +15 мин', callback_data: `rem_snooze15_${r.id}` },
+            { text: '⏰ +1 час', callback_data: `rem_snooze60_${r.id}` }
+          ]]
+        };
+        log(`[Reminder Fired] ${r.id}: ${r.text}`);
+        await notifyAdmin(
+          `⏰ <b>Напоминание от Zetsu!</b>\n\n📌 ${escapeHtml(r.text)}\n\n🕒 <i>${formatLocalDateTime(now)} • ${repeatLabel}</i>`,
+          inlineKb
+        );
+        if (r.repeat && r.repeat !== 'none') {
+          const nextMs = advanceRepeatTime(r.triggerAtMs, r.repeat);
+          if (nextMs) { r.triggerAtMs = nextMs; remaining.push(r); }
         }
+      } else {
+        remaining.push(r);
       }
-    } else {
-      remaining.push(r);
+    }
+    if (changed) {
+      state.reminders = remaining;
+      stateDirty = true;
+      await flushState(true);
     }
   }
 
-  if (changed) {
-    state.reminders = remaining;
-    await persistState(true);
-  }
-}
+  // 2. Morning Briefing (once per day after configured hour:minute UTC+5)
+  if (state.config.morning_briefing_enabled) {
+    const localD = new Date(now + TZ_OFFSET_MS);
+    const { dateStr } = storage.getLocalDateParts(now);
+    const h = localD.getUTCHours();
+    const m = localD.getUTCMinutes();
+    const targetH = state.config.morning_briefing_hour ?? 8;
+    const targetM = state.config.morning_briefing_minute ?? 30;
 
-setInterval(checkReminders, 15000);
-
-// ==========================================
-// Scheduled Tasks (Diceplay / Kotya)
-// ==========================================
-async function executeTask(task) {
-  if (!state.config.is_running || !task.enabled || !state.config.chat_id) return false;
-  log(`[Task ${task.name}] Sending "${task.command_text}" to ${state.config.chat_id} (topic: ${state.config.message_thread_id})`);
-  const payload = {
-    chat_id: state.config.chat_id,
-    text: task.command_text
-  };
-  if (state.config.message_thread_id) payload.message_thread_id = state.config.message_thread_id;
-
-  const res = await tgCall('sendMessage', payload);
-  if (res.ok) {
-    task.last_sent_timestamp = Date.now();
-    task.total_sent_count = (task.total_sent_count || 0) + 1;
-    persistState();
-    return true;
-  }
-  log(`[Task ${task.name}] Error: ${res.description || res.error}`);
-  return false;
-}
-
-let taskTimers = {};
-function startAllTimers() {
-  for (const tid of Object.keys(taskTimers)) clearInterval(taskTimers[tid]);
-  taskTimers = {};
-  if (!state.config.is_running) return;
-  for (const task of state.config.tasks) {
-    if (task.enabled && task.interval_minutes > 0) {
-      taskTimers[task.id] = setInterval(() => executeTask(task), task.interval_minutes * 60 * 1000);
+    if (state.config.last_briefing_date !== dateStr && (h > targetH || (h === targetH && m >= targetM)) && h < 13) {
+      state.config.last_briefing_date = dateStr;
+      stateDirty = true;
+      await sendMorningBriefing(dateStr);
+      await flushState(true);
     }
   }
 }
 
+async function sendMorningBriefing(dateStr) {
+  const todayStart = Date.parse(`${dateStr}T00:00:00+05:00`);
+  const todayEnd = todayStart + 86400000;
+  const todayRems = state.reminders
+    .filter(r => r.triggerAtMs >= todayStart && r.triggerAtMs < todayEnd)
+    .sort((a, b) => a.triggerAtMs - b.triggerAtMs);
+  const openTasks = await storage.getOpenTasks(8);
+
+  if (todayRems.length === 0 && openTasks.length === 0) return;
+
+  let msg = `🌅 <b>Утренний брифинг Zetsu (${dateStr})</b>\n\n`;
+  if (todayRems.length > 0) {
+    msg += `⏰ <b>Напоминания на сегодня:</b>\n` +
+      todayRems.map(r => `• <b>${formatLocalDateTime(r.triggerAtMs).slice(11, 16)}</b> — ${escapeHtml(r.text)}`).join('\n') + '\n\n';
+  }
+  if (openTasks.length > 0) {
+    msg += `☑️ <b>Открытые задачи из Daily Notes:</b>\n` +
+      openTasks.map(t => `• [${t.source}] ${escapeHtml(t.text)}`).join('\n') + '\n\n';
+  }
+  msg += `<i>Продуктивного дня! Можете надиктовать голосовым новые дела или мысли.</i>`;
+  await notifyAdmin(msg);
+}
+
+setInterval(checkRemindersAndBriefing, 15000);
+
 // ==========================================
-// UI Panels (Status, Notes, Reminders)
+// UI Panels (Clean & Minimal)
 // ==========================================
 function getControlPanelPayload() {
-  const schedStatus = state.config.is_running ? '🟢 ВКЛ (каждые 10 мин)' : '🔴 ВЫКЛЮЧЕНА';
-  const replyStatus = state.config.business_auto_reply ? '🟢 ВКЛ (Gemini AI)' : '⚪ ВЫКЛЮЧЕН';
-  const uptimeMin = Math.floor((Date.now() - startedAt) / 60000);
+  const replyStatus = state.config.business_auto_reply ? '🟢 ВКЛ' : '⚪ ВЫКЛ';
+  const briefStatus = state.config.morning_briefing_enabled ? '🟢 ВКЛ (08:30 UTC+5)' : '⚪ ВЫКЛ';
 
   const text =
-    `🎛 <b>Панель управления Zetsu Bot v2.0 (Cloud 24/7)</b>\n\n` +
-    `☁️ <b>Хостинг:</b> GitHub Actions Cloud 24/7 (без ноутбука, смена ${uptimeMin} мин)\n` +
-    `📝 <b>Облачные заметки:</b> GitHub Obsidian Sync (приватный репо)\n` +
+    `⚙️ <b>Панель управления Zetsu Bot v3.0</b>\n\n` +
+    `☁️ <b>Облако:</b> GitHub Actions 24/7 (без ноутбука)\n` +
+    `🎤 <b>Мультимодальность:</b> Голос + Фото/ЭКГ/PDF + Ссылки\n` +
     `⏰ <b>Активных напоминаний:</b> ${state.reminders.length}\n` +
-    `💬 <b>ИИ-автоответчик секретаря:</b> ${replyStatus}\n` +
-    `🎮 <b>Автоотправка «Дисплей» (/diceplay, котя):</b> ${schedStatus}\n` +
-    `📁 <b>Чат ветки:</b> <code>${state.config.chat_id || 'не задан'}</code> (топик: <code>${state.config.message_thread_id || '—'}</code>)\n` +
-    `👤 <b>Последний контакт:</b> ${escapeHtml(state.config.last_business_sender_name || 'нет')} (<code>${state.config.last_business_chat_id || '—'}</code>)\n\n` +
-    `💡 <i>Просто напишите мне обычным текстом: «Запиши заметку...» или «Напомни завтра в 9:00...» — я всё сделаю сам!</i>`;
+    `🌅 <b>Утренний брифинг:</b> ${briefStatus}\n` +
+    `💬 <b>ИИ-секретарь (Business):</b> ${replyStatus}\n` +
+    `👤 <b>Последний контакт:</b> ${escapeHtml(state.config.last_business_sender_name || 'нет')}\n\n` +
+    `<i>Просто пишите текстом, шлите голосовые, фото или ссылки — я всё обработаю сам.</i>`;
 
   const inlineKeyboard = {
     inline_keyboard: [
       [
-        { text: state.config.business_auto_reply ? '🔕 Выкл автоответчик' : '🔔 Вкл автоответчик', callback_data: 'toggle_autoreply' },
-        { text: state.config.is_running ? '⏸ Выкл Дисплей' : '▶️ Вкл Дисплей', callback_data: 'toggle_scheduler' }
+        { text: state.config.business_auto_reply ? '🔕 Выкл секретаря' : '🔔 Вкл секретаря', callback_data: 'toggle_autoreply' },
+        { text: state.config.morning_briefing_enabled ? '🌅 Выкл брифинг' : '🌅 Вкл брифинг', callback_data: 'toggle_briefing' }
       ],
       [
-        { text: '📝 Заметки', callback_data: 'show_notes' },
-        { text: '⏰ Напоминания', callback_data: 'show_reminders' }
-      ],
-      [
-        { text: '🚀 Тест отправки', callback_data: 'send_now' },
+        { text: '🔄 Сбросить диалог', callback_data: 'reset_chat' },
         { text: '🔄 Обновить', callback_data: 'refresh' }
       ]
     ]
@@ -707,54 +604,41 @@ function getControlPanelPayload() {
 async function sendNotesList() {
   const notes = await storage.listNotes('');
   if (notes.length === 0) {
-    return notifyAdmin(
-      `📝 <b>Ваши облачные заметки</b>\n\n` +
-      `Пока пусто. Просто напишите мне в чат:\n` +
-      `<i>«Запиши заметку: купить новый стетоскоп и повторить ЭКГ»</i>`
-    );
+    return notifyAdmin(`📝 <b>Облачные заметки</b>\n\nПока пусто. Надиктуйте голосовое или напишите: <i>«Запиши заметку: ...»</i>`);
   }
   const lines = notes.slice(0, 30).map((n, i) => `${i + 1}. <b>${escapeHtml(n.title)}</b>`);
   return notifyAdmin(
-    `📝 <b>Ваши облачные заметки (${notes.length}):</b>\n\n` +
-    lines.join('\n') +
-    `\n\n<i>Напишите «Прочитай заметку &lt;название&gt;» или «Дополни заметку...» — я открою или обновлю её.</i>`
+    `📝 <b>Ваши заметки в Obsidian Cloud (${notes.length}):</b>\n\n${lines.join('\n')}\n\n` +
+    `<i>Напишите «Прочитай заметку &lt;название&gt;» или просто пришлите мысль/ссылку/голос.</i>`
   );
 }
 
 async function sendRemindersList() {
   if (state.reminders.length === 0) {
-    return notifyAdmin(
-      `⏰ <b>Активные напоминания</b>\n\n` +
-      `Нет запланированных уведомлений.\n` +
-      `Напишите, например: <i>«Напомни через 20 минут выключить чайник»</i> или <i>«Напоминай каждый день в 21:00 выпить витамины»</i>.`
-    );
+    return notifyAdmin(`⏰ <b>Напоминания</b>\n\nПусто. Скажите или напишите: <i>«Напомни завтра в 9:00 ...»</i>`);
   }
   const sorted = [...state.reminders].sort((a, b) => a.triggerAtMs - b.triggerAtMs);
-  const repeatMap = { none: '', hourly: ' 🔁 каждый час', daily: ' 🔁 ежедневно', weekly: ' 🔁 еженедельно' };
+  const repMap = { none: '', hourly: ' 🔁 каждый час', daily: ' 🔁 ежедневно', weekly: ' 🔁 еженедельно' };
   const lines = sorted.map((r, i) =>
-    `${i + 1}. <b>${formatLocalDateTime(r.triggerAtMs)}</b>${repeatMap[r.repeat] || ''}\n` +
-    `   📌 ${escapeHtml(r.text)} <code>[${r.id}]</code>`
+    `${i + 1}. <b>${formatLocalDateTime(r.triggerAtMs)}</b>${repMap[r.repeat] || ''}\n   📌 ${escapeHtml(r.text)} <code>[${r.id}]</code>`
   );
+  return notifyAdmin(`⏰ <b>Активные напоминания (${sorted.length}):</b>\n\n${lines.join('\n\n')}`);
+}
+
+async function sendMemoryView() {
+  cachedMemory = await storage.loadMemory();
+  if (!cachedMemory.trim()) {
+    return notifyAdmin(`🧠 <b>Долгосрочная память пуста</b>\n\nНапишите: <i>«Запомни, что я ...»</i> — я сохраню это навсегда в <code>memory.md</code>.`);
+  }
   return notifyAdmin(
-    `⏰ <b>Активные напоминания (${sorted.length}):</b>\n\n` +
-    lines.join('\n\n') +
-    `\n\n<i>Чтобы отменить, напишите: «Удали напоминание &lt;текст или ID&gt;»</i>`
+    `🧠 <b>Долгосрочная память Zetsu:</b>\n\n${escapeHtml(cachedMemory.slice(0, 3500))}\n\n` +
+    `<i>Можно сказать «Запомни...» или «Забудь про...».</i>`
   );
 }
 
 // ==========================================
 // Handlers (Business, Callback, Message)
 // ==========================================
-function parseTelegramLink(str) {
-  const m1 = str.match(/t\.me\/c\/(\d+)\/(\d+)\/(\d+)/);
-  if (m1) return { chat_id: '-100' + m1[1], message_thread_id: parseInt(m1[2], 10) };
-  const m2 = str.match(/t\.me\/c\/(\d+)\/(\d+)/);
-  if (m2) return { chat_id: '-100' + m2[1], message_thread_id: parseInt(m2[2], 10) };
-  const m3 = str.match(/t\.me\/([a-zA-Z0-9_]+)\/(\d+)\/(\d+)/);
-  if (m3) return { chat_id: '@' + m3[1], message_thread_id: parseInt(m3[2], 10) };
-  return null;
-}
-
 async function handleBusinessMessage(msg) {
   const senderId = msg.from?.id;
   if (senderId === ADMIN_ID) return;
@@ -762,40 +646,34 @@ async function handleBusinessMessage(msg) {
   const senderChatId = msg.chat?.id;
   const incomingText = msg.text || '[медиа/файл]';
 
-  log(`[Business Message] From ${senderName} (${senderChatId}): "${incomingText}"`);
   state.config.last_business_chat_id = senderChatId;
   state.config.last_business_sender_name = senderName;
   if (msg.from?.username) {
     state.knownUsers[msg.from.username.toLowerCase()] = senderChatId;
     state.knownUsers['@' + msg.from.username.toLowerCase()] = senderChatId;
   }
-  persistState();
+  stateDirty = true;
 
   if (state.config.business_auto_reply && msg.text) {
-    const aiPrompt =
-      `Собеседник ${senderName} написал личное сообщение: "${incomingText}".\n` +
-      `Ответь кратко (1-3 предложения), живо и естественно от лица ассистента DevilVsLife. Зеркалируй тон собеседника.`;
-    const sysPrompt = 'Ты — остроумный и живой персональный ассистент DevilVsLife. Никаких шаблонных фраз робота.';
-    const aiRes = await askGeminiSimple(aiPrompt, sysPrompt);
-    if (aiRes.ok) {
-      const replyRes = await sendAsMe(senderChatId, aiRes.text);
-      if (replyRes.ok) {
+    const res = await callGeminiWithFallback(
+      [{ role: 'user', parts: [{ text: `Собеседник ${senderName} написал: "${incomingText}". Ответь кратко (1-3 предложения) и живо от лица ассистента DevilVsLife, зеркалируя тон.` }] }],
+      'Ты — остроумный и живой персональный ассистент DevilVsLife. Никаких шаблонных фраз робота.',
+      false
+    );
+    if (res.ok) {
+      const replyText = (res.content.parts || []).map(p => p.text || '').join('\n').trim();
+      const sendRes = await sendAsMe(senderChatId, replyText);
+      if (sendRes.ok) {
         return notifyAdmin(
-          `🤖 <b>Секретарь Zetsu ответил от вашего имени!</b>\n\n` +
-          `👤 <b>Кому:</b> ${escapeHtml(senderName)} (ID: <code>${senderChatId}</code>)\n` +
-          `💬 <b>Входящее:</b> ${escapeHtml(incomingText)}\n` +
-          `✍️ <b>Ответ:</b>\n${escapeHtml(aiRes.text)}`
+          `🤖 <b>Секретарь ответил ${escapeHtml(senderName)}:</b>\n💬 ${escapeHtml(incomingText)}\n✍️ ${escapeHtml(replyText)}`
         );
       }
     }
   }
 
   notifyAdmin(
-    `📩 <b>Новое сообщение в ваш личный профиль!</b>\n\n` +
-    `👤 <b>От:</b> ${escapeHtml(senderName)}\n` +
-    `🆔 <b>ID чата:</b> <code>${senderChatId}</code>\n` +
-    `💬 <b>Текст:</b> ${escapeHtml(incomingText)}\n\n` +
-    `<i>Ответить от своего имени:</i> <code>/say текст ответа</code>`
+    `📩 <b>Личное сообщение от ${escapeHtml(senderName)}</b> (<code>${senderChatId}</code>):\n\n` +
+    `${escapeHtml(incomingText)}\n\n<i>Ответить:</i> <code>/say текст</code>`
   );
 }
 
@@ -809,160 +687,79 @@ async function handleCallbackQuery(cb) {
     return tgCall('answerCallbackQuery', { callback_query_id: cbId, text: 'Доступ ограничен.' });
   }
 
-  // Reminder snooze / ack buttons
   if (data.startsWith('rem_ack_')) {
-    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: '✅ Отмечено!' });
-    if (msgId && chatId) {
-      await tgCall('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
-    }
+    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: '✅ Готово!' });
+    if (msgId && chatId) await tgCall('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
     return;
   }
   if (data.startsWith('rem_snooze15_') || data.startsWith('rem_snooze60_')) {
     const mins = data.startsWith('rem_snooze15_') ? 15 : 60;
     const origText = (cb.message?.text || '').split('\n').find(l => l.startsWith('📌'))?.replace('📌', '').trim() || 'Напоминание';
-    const newId = 'rem_' + Date.now().toString(36);
     const nextMs = Date.now() + mins * 60 * 1000;
-    state.reminders.push({ id: newId, text: origText, triggerAtMs: nextMs, repeat: 'none', createdAtMs: Date.now() });
-    await persistState(true);
-    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: `⏰ Отложено на ${mins} мин!` });
-    if (msgId && chatId) {
-      await tgCall('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
-    }
-    return notifyAdmin(`⏰ Отложил напоминание «${escapeHtml(origText)}» на <b>${formatLocalDateTime(nextMs)}</b>.`);
-  }
-
-  if (data === 'show_notes') {
-    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: 'Загружаю заметки...' });
-    return sendNotesList();
-  }
-  if (data === 'show_reminders') {
-    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: 'Загружаю напоминания...' });
-    return sendRemindersList();
+    state.reminders.push({ id: 'rem_' + Date.now().toString(36), text: origText, triggerAtMs: nextMs, repeat: 'none', createdAtMs: Date.now() });
+    stateDirty = true;
+    await flushState(true);
+    await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: `⏰ Отложено на ${mins} мин` });
+    if (msgId && chatId) await tgCall('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
+    return notifyAdmin(`⏰ Отложил «${escapeHtml(origText)}» на <b>${formatLocalDateTime(nextMs)}</b>.`);
   }
 
   let toast = '';
-  if (data === 'toggle_scheduler') {
-    state.config.is_running = !state.config.is_running;
-    persistState(true);
-    startAllTimers();
-    toast = state.config.is_running ? '🟢 Дисплей ВКЛЮЧЕН!' : '🔴 Дисплей ОТКЛЮЧЕН!';
-  } else if (data === 'toggle_autoreply') {
+  if (data === 'toggle_autoreply') {
     state.config.business_auto_reply = !state.config.business_auto_reply;
-    persistState(true);
-    toast = state.config.business_auto_reply ? '🟢 Автоответчик ВКЛЮЧЕН!' : '⚪ Автоответчик ОТКЛЮЧЕН!';
-  } else if (data === 'send_now') {
-    for (const t of state.config.tasks) await executeTask(t);
-    toast = '🚀 Команды отправлены!';
+    stateDirty = true;
+    await flushState(true);
+    toast = state.config.business_auto_reply ? '🟢 Секретарь ВКЛ' : '⚪ Секретарь ВЫКЛ';
+  } else if (data === 'toggle_briefing') {
+    state.config.morning_briefing_enabled = !state.config.morning_briefing_enabled;
+    stateDirty = true;
+    await flushState(true);
+    toast = state.config.morning_briefing_enabled ? '🟢 Утренний брифинг ВКЛ' : '⚪ Утренний брифинг ВЫКЛ';
+  } else if (data === 'reset_chat') {
+    adminChatHistory = [];
+    toast = '🔄 Контекст диалога очищен';
   } else if (data === 'refresh') {
-    toast = '🔄 Статус обновлён';
+    toast = '🔄 Обновлено';
   }
 
   await tgCall('answerCallbackQuery', { callback_query_id: cbId, text: toast });
   if (msgId && chatId) {
     const panel = getControlPanelPayload();
-    await tgCall('editMessageText', {
-      chat_id: chatId,
-      message_id: msgId,
-      text: panel.text,
-      parse_mode: 'HTML',
-      reply_markup: panel.inlineKeyboard
-    });
+    await tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: panel.text, parse_mode: 'HTML', reply_markup: panel.inlineKeyboard });
   }
 }
 
 async function handleMessage(msg) {
   const chatId = msg.chat?.id;
   const fromId = msg.from?.id;
-  let text = (msg.text || '').trim().replace(/^[•\s\-\*]+/, '').trim();
-  if (!text) return;
-
-  // Group binding
-  if (msg.chat?.type === 'supergroup' || msg.chat?.type === 'group') {
-    if (text.startsWith('/setchat') || text.startsWith('/here') || (fromId === ADMIN_ID && text.startsWith('/link'))) {
-      state.config.chat_id = String(msg.chat.id);
-      state.config.chat_title = msg.chat.title || '';
-      if (msg.message_thread_id) state.config.message_thread_id = msg.message_thread_id;
-      persistState(true);
-      await tgCall('sendMessage', {
-        chat_id: msg.chat.id,
-        message_thread_id: msg.message_thread_id || undefined,
-        text: `✅ Топик «${msg.chat.title || ''}» привязан для Zetsu Cloud Bot!`
-      });
-      return notifyAdmin(`✅ Группа привязана: ${escapeHtml(state.config.chat_title)} (<code>${state.config.chat_id}</code>)`);
-    }
-    return;
-  }
-
-  // Only ADMIN_ID in private chat
   if (fromId !== ADMIN_ID || msg.chat?.type !== 'private') return;
+
+  const text = (msg.text || msg.caption || '').trim();
   const textLower = text.toLowerCase();
 
-  // Business direct start
+  // Quick 4-button keyboard & commands
+  if (text === '📝 Заметки' || textLower === '/notes') return sendNotesList();
+  if (text === '⏰ Напоминания' || textLower === '/reminders') return sendRemindersList();
+  if (text === '🧠 Память' || textLower === '/memory') return sendMemoryView();
+  if (['⚙️ Панель', '/status', '/menu', '/start', '/help'].includes(text) || ['/status', '/menu', '/start', '/help'].includes(textLower)) {
+    const panel = getControlPanelPayload();
+    return notifyAdmin(panel.text, panel.inlineKeyboard);
+  }
+  if (['/reset', '/clear', 'сброс'].includes(textLower)) {
+    adminChatHistory = [];
+    return notifyAdmin('🔄 <b>Контекст диалога очищен!</b> (Долгосрочная память в <code>memory.md</code> сохранена)');
+  }
+
+  // Telegram Business quick replies
   if (text.startsWith('/start bizChat')) {
     const numId = parseInt(text.replace('/start bizChat', '').trim(), 10);
     if (!isNaN(numId)) {
       state.config.last_business_chat_id = numId;
       const info = await tgCall('getChat', { chat_id: numId });
-      if (info.ok) {
-        state.config.last_business_sender_name = info.result.first_name + (info.result.username ? ` (@${info.result.username})` : '');
-      }
-      persistState(true);
-      return notifyAdmin(`👤 Контакт выбран: ${escapeHtml(state.config.last_business_sender_name || numId)} (<code>${numId}</code>)\nОтветить: <code>/say текст</code>`);
+      if (info.ok) state.config.last_business_sender_name = info.result.first_name + (info.result.username ? ` (@${info.result.username})` : '');
+      stateDirty = true;
+      return notifyAdmin(`👤 Контакт выбран: ${escapeHtml(state.config.last_business_sender_name || numId)}\nОтветить: <code>/say текст</code>`);
     }
-  }
-
-  // Paste t.me link
-  if (text.includes('t.me/c/') || text.includes('t.me/')) {
-    const parsed = parseTelegramLink(text);
-    if (parsed) {
-      state.config.chat_id = parsed.chat_id;
-      if (parsed.message_thread_id) state.config.message_thread_id = parsed.message_thread_id;
-      persistState(true);
-      return notifyAdmin(`✅ Чат и ветка привязаны: <code>${state.config.chat_id}</code> (топик: <code>${state.config.message_thread_id || 'Основной'}</code>)`);
-    }
-  }
-
-  // Quick Keyboard & Commands
-  if (text === '📝 Мои заметки' || textLower === '/notes' || textLower === 'заметки') {
-    return sendNotesList();
-  }
-  if (text === '⏰ Напоминания' || textLower === '/reminders' || textLower === 'напоминания') {
-    return sendRemindersList();
-  }
-  if (text === '🔕 Выключить автоответчик' || textLower === '/autoreply off' || textLower === 'выключить автоответчик') {
-    state.config.business_auto_reply = false;
-    persistState(true);
-    return notifyAdmin('⚪ <b>ИИ-автоответчик секретаря ВЫКЛЮЧЕН.</b>');
-  }
-  if (text === '🔔 Включить автоответчик' || textLower === '/autoreply on' || textLower === 'включить автоответчик') {
-    state.config.business_auto_reply = true;
-    persistState(true);
-    return notifyAdmin('🟢 <b>ИИ-автоответчик секретаря ВКЛЮЧЕН!</b>');
-  }
-  if (text === '⏸ Отключить Дисплей' || textLower === '/stop_auto' || textLower === 'отключить дисплей') {
-    state.config.is_running = false;
-    persistState(true);
-    startAllTimers();
-    return notifyAdmin('🔴 <b>Автоотправка «Дисплей» и «Котя» ОТКЛЮЧЕНА.</b>');
-  }
-  if (text === '▶️ Включить Дисплей' || textLower === '/start_auto' || textLower === 'включить дисплей') {
-    state.config.is_running = true;
-    persistState(true);
-    startAllTimers();
-    return notifyAdmin('🟢 <b>Автоотправка «Дисплей» и «Котя» ВКЛЮЧЕНА!</b>');
-  }
-  if (text === '🚀 Тест отправки' || textLower === '/send_now') {
-    notifyAdmin('⏳ Отправляю тестовые команды...');
-    for (const t of state.config.tasks) await executeTask(t);
-    return notifyAdmin(`✅ Команды отправлены в <code>${state.config.chat_id}</code>.`);
-  }
-  if (['📊 Статус и Панель', '📊 Статус', 'статус', '/status', '/menu', '/panel', '/start', '/help'].includes(textLower) || text === '📊 Статус и Панель') {
-    const panel = getControlPanelPayload();
-    return notifyAdmin(panel.text, panel.inlineKeyboard);
-  }
-  if (['/reset', '/clear', 'сброс', 'очистить'].includes(textLower)) {
-    adminChatHistory = [];
-    return notifyAdmin('🔄 <b>Память диалога очищена!</b>');
   }
   if (text.startsWith('/say ')) {
     const msgText = text.replace('/say ', '').trim();
@@ -972,15 +769,14 @@ async function handleMessage(msg) {
       ? notifyAdmin(`✅ Отправлено ${escapeHtml(state.config.last_business_sender_name)}: "${escapeHtml(msgText)}"`)
       : notifyAdmin(`❌ Ошибка: ${escapeHtml(res.description || res.error)}`);
   }
-  const naturalMatch = text.match(/^(?:ответь|скажи|напиши)\s+([a-zA-Z0-9_а-яА-ЯёЁ@]+)[:\s]+(.+)$/i);
-  if (naturalMatch) {
-    const targetName = naturalMatch[1].toLowerCase().replace('@', '');
-    const replyBody = naturalMatch[2].trim();
+  const natMatch = text.match(/^(?:ответь|скажи|напиши)\s+([a-zA-Z0-9_а-яА-ЯёЁ@]+)[:\s]+(.+)$/i);
+  if (natMatch) {
+    const targetName = natMatch[1].toLowerCase().replace('@', '');
     const targetChatId = state.knownUsers[targetName] || state.config.last_business_chat_id;
     if (targetChatId) {
-      const res = await sendAsMe(targetChatId, replyBody);
+      const res = await sendAsMe(targetChatId, natMatch[2].trim());
       return res.ok
-        ? notifyAdmin(`✅ Отправлено ${escapeHtml(targetName)} (<code>${targetChatId}</code>): "${escapeHtml(replyBody)}"`)
+        ? notifyAdmin(`✅ Отправлено ${escapeHtml(targetName)}: "${escapeHtml(natMatch[2].trim())}"`)
         : notifyAdmin(`❌ Ошибка: ${escapeHtml(res.description || res.error)}`);
     }
   }
@@ -989,42 +785,75 @@ async function handleMessage(msg) {
     const target = parts[0];
     const msgText = parts.slice(1).join(' ').trim();
     if (!target || !msgText) return notifyAdmin('⚠️ Формат: <code>/as_me &lt;id_или_@user&gt; &lt;текст&gt;</code>');
-    let targetId = state.knownUsers[target.replace('@', '').toLowerCase()] || target;
+    const targetId = state.knownUsers[target.replace('@', '').toLowerCase()] || target;
     const res = await sendAsMe(targetId, msgText);
     return res.ok
       ? notifyAdmin(`✅ Отправлено <code>${escapeHtml(targetId)}</code>: "${escapeHtml(msgText)}"`)
       : notifyAdmin(`❌ Ошибка: ${escapeHtml(res.description || res.error)}`);
   }
-  if (text.startsWith('/setkey ')) {
-    const newKey = text.replace('/setkey ', '').trim();
-    if (newKey) {
-      state.config.gemini_api_key = newKey;
-      return notifyAdmin('✅ Ключ Gemini API обновлён в текущей сессии.');
+
+  // Build multimodal Gemini input (Voice / Photo / PDF / Forwarded / Text)
+  const userParts = [];
+  let historySummary = text;
+
+  // 1. Voice / Audio message
+  if (msg.voice || msg.audio) {
+    await tgCall('sendChatAction', { chat_id: chatId, action: 'typing' });
+    const fileId = msg.voice ? msg.voice.file_id : msg.audio.file_id;
+    const mimeType = msg.voice ? 'audio/ogg' : (msg.audio.mime_type || 'audio/mpeg');
+    const dl = await downloadTelegramFile(fileId);
+    if (!dl || dl.error) return notifyAdmin(`⚠️ Не удалось скачать голосовое: ${dl?.error || 'ошибка Telegram'}`);
+    userParts.push({ inlineData: { mimeType, data: dl.base64 } });
+    userParts.push({ text: text || 'Прослушай это голосовое сообщение от пользователя и выполни его просьбу (запиши заметку, поставь напоминание, запомни факт или ответь).' });
+    historySummary = `[Голосовое сообщение] ${text}`.trim();
+  }
+  // 2. Photo (Vision / OCR)
+  else if (msg.photo && msg.photo.length > 0) {
+    await tgCall('sendChatAction', { chat_id: chatId, action: 'typing' });
+    const bestPhoto = msg.photo[msg.photo.length - 1];
+    const dl = await downloadTelegramFile(bestPhoto.file_id);
+    if (!dl || dl.error) return notifyAdmin(`⚠️ Не удалось скачать фото: ${dl?.error || 'ошибка'}`);
+    userParts.push({ inlineData: { mimeType: 'image/jpeg', data: dl.base64 } });
+    userParts.push({ text: text || 'Проанализируй это изображение (если это текст/анализы/ЭКГ/рецепт — расшифруй и дай чёткую выжимку).' });
+    historySummary = `[Фото] ${text}`.trim();
+  }
+  // 3. Document (PDF or Image file)
+  else if (msg.document) {
+    const mime = msg.document.mime_type || '';
+    if (mime === 'application/pdf' || mime.startsWith('image/')) {
+      await tgCall('sendChatAction', { chat_id: chatId, action: 'typing' });
+      const dl = await downloadTelegramFile(msg.document.file_id);
+      if (!dl || dl.error) return notifyAdmin(`⚠️ Не удалось скачать файл: ${dl?.error || 'ошибка'}`);
+      userParts.push({ inlineData: { mimeType: mime, data: dl.base64 } });
+      userParts.push({ text: text || `Проанализируй документ «${msg.document.file_name || 'файл'}» и сделай краткую структурированную выжимку.` });
+      historySummary = `[Документ: ${msg.document.file_name}] ${text}`.trim();
+    } else {
+      return notifyAdmin('⚠️ Поддерживаются фото, голосовые и PDF-документы.');
     }
   }
-  if (text.startsWith('/settopic ')) {
-    const val = parseInt(text.replace('/settopic ', '').trim(), 10);
-    if (!isNaN(val) && val >= 0) {
-      state.config.message_thread_id = val === 0 ? null : val;
-      persistState(true);
-      return notifyAdmin(`✅ Топик установлен: <code>${state.config.message_thread_id || 'Основной'}</code>`);
-    }
+  // 4. Forwarded text message -> hint to save to Daily Note / Inbox
+  else if (text) {
+    await tgCall('sendChatAction', { chat_id: chatId, action: 'typing' });
+    const isForwarded = Boolean(msg.forward_origin || msg.forward_from || msg.forward_from_chat);
+    const prompt = isForwarded
+      ? `Пользователь переслал сообщение (вероятно, хочет сохранить в Daily Note или разобрать):\n\n${text}`
+      : text;
+    userParts.push({ text: prompt });
+    historySummary = text;
+  } else {
+    return;
   }
 
-  // All other messages (including /note, /remind, or natural Russian text) -> Zetsu AI Agent with Tools!
-  await tgCall('sendChatAction', { chat_id: chatId, action: 'typing' });
-  const aiRes = await askZetsuAgent(text);
+  const aiRes = await askZetsuAgent(userParts, historySummary);
   if (aiRes.ok) {
-    return await sendLongMessage(chatId, aiRes.text, getPersistentKeyboard());
-  } else {
-    return notifyAdmin(`⚠️ <b>Ошибка Zetsu AI:</b> <code>${escapeHtml(aiRes.error)}</code>`);
+    return sendLongMessage(chatId, aiRes.text, getPersistentKeyboard());
   }
+  return notifyAdmin(`⚠️ <b>Ошибка Zetsu AI:</b> <code>${escapeHtml(aiRes.error)}</code>`);
 }
 
 // ==========================================
-// Telegram Long Polling Loop
+// Polling Loop & Graceful Shift Handoff
 // ==========================================
-let lastUpdateId = 0;
 let isPolling = false;
 
 async function pollUpdates() {
@@ -1033,30 +862,26 @@ async function pollUpdates() {
   let nextDelay = 300;
 
   try {
-    const pollTimeout = isShuttingDown ? 1 : (RUN_MINUTES > 0 ? 15 : 25);
     const res = await tgCall('getUpdates', {
       offset: lastUpdateId + 1,
-      timeout: pollTimeout,
-      allowed_updates: ['message', 'business_connection', 'business_message', 'channel_post', 'my_chat_member', 'chat_member', 'callback_query']
+      timeout: isShuttingDown ? 1 : (RUN_MINUTES > 0 ? 15 : 25),
+      allowed_updates: ['message', 'business_connection', 'business_message', 'callback_query']
     });
 
     if (res.ok && Array.isArray(res.result)) {
-      lastPollOkAt = Date.now();
-      let hadUpdates = false;
       for (const u of res.result) {
-        hadUpdates = true;
         lastUpdateId = u.update_id;
+        stateDirty = true; // will be saved on graceful shutdown or immediate reminder/setting change
         if (u.business_connection) {
           businessConnectionId = u.business_connection.id;
-          log('Updated business_connection_id: ' + businessConnectionId);
+          log('Updated business_connection_id');
         }
         if (u.business_message) await handleBusinessMessage(u.business_message);
         if (u.callback_query) await handleCallbackQuery(u.callback_query);
         if (u.message) await handleMessage(u.message);
       }
-      if (hadUpdates) persistState();
     } else if (res.error_code === 409) {
-      log('409 Conflict: Another bot instance is polling. Waiting 5s...');
+      log('409 Conflict: waiting 5s for previous shift to exit...');
       nextDelay = 5000;
     } else if (!res.ok) {
       log('getUpdates error: ' + (res.description || res.error));
@@ -1069,61 +894,62 @@ async function pollUpdates() {
     isPolling = false;
   }
 
-  if (!isShuttingDown) {
-    setTimeout(pollUpdates, nextDelay);
-  }
+  if (!isShuttingDown) setTimeout(pollUpdates, nextDelay);
 }
 
-async function gracefulShutdown(reason = 'timer') {
+async function gracefulShutdown(reason = 'handoff') {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  log(`=== Graceful shutdown (${reason}): persisting state to GitHub... ===`);
+  log(`=== Graceful shutdown (${reason}): flushing state if changed ===`);
   try {
-    await checkReminders();
-    await persistState(true);
+    await checkRemindersAndBriefing();
+    await flushState(false); // only commits if something actually changed during this shift!
   } catch (e) {
-    log('Shutdown persist error: ' + e.message);
+    log('Shutdown flush error: ' + e.message);
   }
-  try { server.close(); } catch (_) {}
-  log('=== Shutdown complete ===');
+  log('=== Shift complete ===');
   process.exit(0);
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// ==========================================
-// Boot sequence
-// ==========================================
 async function boot() {
-  log(`=== Zetsu Bot v2.0 (Cloud 24/7) Booting (runMinutes=${RUN_MINUTES || 'forever'}) ===`);
-  const loaded = await storage.loadState();
+  log(`=== Zetsu Bot v3.0 (Cloud 24/7) Booting (runMinutes=${RUN_MINUTES || 'forever'}) ===`);
+  const [loaded, mem] = await Promise.all([storage.loadState(), storage.loadMemory()]);
+  cachedMemory = mem || '';
+
   if (loaded) {
     if (loaded.lastUpdateId) lastUpdateId = loaded.lastUpdateId;
     if (loaded.businessConnectionId) businessConnectionId = loaded.businessConnectionId;
     if (Array.isArray(loaded.adminChatHistory)) adminChatHistory = loaded.adminChatHistory;
     if (loaded.config) {
-      state.config = { ...state.config, ...loaded.config, gemini_api_key: process.env.GEMINI_API_KEY || state.config.gemini_api_key };
+      state.config = {
+        ...state.config,
+        business_auto_reply: Boolean(loaded.config.business_auto_reply),
+        morning_briefing_enabled: loaded.config.morning_briefing_enabled ?? true,
+        morning_briefing_hour: loaded.config.morning_briefing_hour ?? 8,
+        morning_briefing_minute: loaded.config.morning_briefing_minute ?? 30,
+        last_briefing_date: loaded.config.last_briefing_date || '',
+        last_business_chat_id: loaded.config.last_business_chat_id || null,
+        last_business_sender_name: loaded.config.last_business_sender_name || ''
+      };
     }
     if (loaded.knownUsers) state.knownUsers = { ...state.knownUsers, ...loaded.knownUsers };
     if (Array.isArray(loaded.reminders)) state.reminders = loaded.reminders;
-    log(`Loaded state from GitHub: ${state.reminders.length} reminders, lastUpdateId=${lastUpdateId}.`);
+    log(`Loaded state: ${state.reminders.length} reminders, memory=${cachedMemory.length} chars, lastUpdateId=${lastUpdateId}`);
   } else {
-    log('No existing state.json in GitHub — initializing fresh state.');
-    await persistState(true);
+    stateDirty = true;
+    await flushState(true);
   }
 
-  // Run due reminders immediately on boot
-  await checkReminders();
-  startAllTimers();
+  await checkRemindersAndBriefing();
   pollUpdates();
 
   if (RUN_MINUTES > 0) {
-    const runMs = Math.max(30000, Math.floor(RUN_MINUTES * 60 * 1000));
-    log(`Scheduled graceful handoff exit in ${RUN_MINUTES} minutes.`);
-    setTimeout(() => gracefulShutdown('handoff'), runMs);
+    setTimeout(() => gracefulShutdown('handoff'), Math.max(30000, Math.floor(RUN_MINUTES * 60 * 1000)));
   }
-  log('=== Zetsu Bot v2.0 Ready ===');
+  log('=== Zetsu Bot v3.0 Ready ===');
 }
 
 boot();

@@ -1,0 +1,12 @@
+{
+  "name": "zetsu-bot-cloud",
+  "version": "2.0.0",
+  "description": "Zetsu 24/7 Cloud Telegram Bot with AI Notes, Reminders, Business Secretary & GitHub Persistent Brain",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

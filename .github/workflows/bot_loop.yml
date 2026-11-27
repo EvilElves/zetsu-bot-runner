@@ -9,6 +9,10 @@ concurrency:
   group: zetsu-bot-live-loop
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -30,3 +34,15 @@ jobs:
           GH_REPO: ${{ secrets.GH_REPO }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: node bot.js --run-minutes=20
+
+      - name: Trigger Next Shift (Seamless 24/7 Handoff)
+        if: ${{ !cancelled() }}
+        env:
+          DISPATCH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" != "success" ]; then
+            echo "Shift ended with status $JOB_STATUS, waiting 15s before restart..."
+            sleep 15
+          fi
+          curl -sS -X POST             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $DISPATCH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot_loop.yml/dispatches"             -d '{"ref":"main"}'
